@@ -158,18 +158,25 @@ doc_events = {
     },
     "Asset": {
         "validate": "sge_asset_management.feature.parent_asset.set_defaults_for_parent_asset",
-        "on_submit": "sge_asset_management.feature.composite_component_capitalization.append_composite_component_to_asset_capitalization",
+        "on_submit": [
+            "sge_asset_management.feature.composite_component_capitalization.append_composite_component_to_asset_capitalization",
+            # A Composite Asset is built up over several Asset Capitalizations while it sits in
+            # Work In Progress; its components are raised here, when it is submitted and becomes
+            # a real asset, rather than one capitalization at a time against a draft target.
+            "sge_asset_management.feature.component_asset_creation.create_component_assets",
+        ],
         "before_cancel": "sge_asset_management.feature.composite_component_capitalization.remove_composite_component_from_asset_capitalization",
+        # on_cancel, not before_cancel: frappe runs on_cancel ahead of the "still linked" check,
+        # and the component Assets link back through custom_parent_asset.
+        "on_cancel": "sge_asset_management.feature.component_asset_creation.cancel_component_assets_for_target",
     },
     "Asset Capitalization": {
         "before_gl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
         "before_sl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
         "validate": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
         "before_submit": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
-        # Runs after the controller's own on_submit (which posts the ledgers and rolls the
-        # consumed value into the Target Asset), so the component Assets below are raised
-        # against a Target Asset that already carries its final value.
-        "on_submit": "sge_asset_management.feature.component_asset_creation.create_component_assets",
+        # Cancelling a capitalization after its target was submitted takes the value back off
+        # the target, so the components it contributed have to go with it.
         "on_cancel": "sge_asset_management.feature.component_asset_creation.cancel_component_assets",
     },
 }

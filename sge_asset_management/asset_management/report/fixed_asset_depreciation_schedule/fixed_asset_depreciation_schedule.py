@@ -1,3 +1,5 @@
+from collections import Counter
+
 import frappe
 from frappe import _
 from frappe.utils import flt, getdate
@@ -50,16 +52,155 @@ def execute(filters=None):
 	# a Straight Line (or other) asset would misstate it, so such assets are excluded rather than
 	# silently shown with the wrong method's numbers.
 	rows = get_register_rows(filters, depreciation_methods={"Written Down Value"})
-	return get_tree_columns(), build_asset_tree(rows, filters)
+	data = build_asset_tree(rows, filters)
+	return get_tree_columns(), data, None, get_chart(data, filters)
+
+
+LEAD_COLUMNS = ("asset", "asset_description")
 
 
 def get_tree_columns():
-	"""Same columns as the flat register, with the Asset link promoted to the front —
-	frappe-datatable draws the expand/collapse control on the first column only."""
-	columns = get_columns()
-	asset_column = next(c for c in columns if c["fieldname"] == "asset")
-	rest = [c for c in columns if c["fieldname"] != "asset"]
-	return [dict(asset_column, width=240)] + rest
+	"""Same columns as the flat register, led by the Asset link and its name.
+
+	The Asset link has to come first — frappe-datatable draws the expand/collapse control on the
+	first column only — and the name follows it, so the two things that identify a row are side
+	by side instead of the name sitting eight columns to the right.
+	"""
+	columns = {c["fieldname"]: c for c in get_columns()}
+	rest = [c for c in get_columns() if c["fieldname"] not in LEAD_COLUMNS]
+
+	return [
+		dict(columns["asset"], width=200),
+		dict(columns["asset_description"], label=_("Asset Name"), width=220),
+	] + rest
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Chart
+# ─────────────────────────────────────────────────────────────────
+# A register routinely holds several thousand Assets, so the chart buckets them rather than
+# drawing one bar per Asset. Schedule II classification is the default because that is the
+# grouping this schedule is computed against; the rest are the other dimensions the report
+# already carries per row.
+CHART_GROUPS = {
+	"Classification": "classification",
+	"Asset Category": "ledger_name",
+	"Location": "location",
+	"Asset": "asset_description",
+}
+DEFAULT_CHART_GROUP = "Classification"
+
+# Past this many bars a grouped four-series chart stops being readable. The tail is summed into
+# a single "Others" bar rather than dropped, so the chart still totals to the report.
+CHART_LIMIT = 12
+
+CHART_SERIES = (
+	("Opening WDV", "opening_wdv", "#7cd6fd"),
+	("Additions", "addition", "#4bc0a2"),
+	("Depreciation for the Year", "dep_current_year", "#ff5858"),
+	("Closing WDV", "closing_wdv", "#743ee2"),
+)
+CHART_FIELDS = tuple(fieldname for _label, fieldname, _color in CHART_SERIES)
+
+
+def get_chart(rows, filters):
+	"""Grouped bars of opening WDV → additions → depreciation → closing WDV per bucket.
+
+	Buckets, not Assets: a company with six thousand Assets would otherwise get six thousand
+	bars, and picking the largest handful of them says nothing about the register as a whole —
+	whereas the same figures summed by classification are exactly the Schedule II summary the
+	schedule is built to support.
+	"""
+	fieldname = CHART_GROUPS.get(filters.get("chart_group_by")) or CHART_GROUPS[DEFAULT_CHART_GROUP]
+	buckets = group_for_chart(rows, fieldname)
+
+	# One bucket is not a comparison — a single-hierarchy period (or a register where every
+	# asset shares a classification) reads better broken back out into its individual assets.
+	if len(buckets) < 2 and fieldname != CHART_GROUPS["Asset"]:
+		buckets = group_for_chart(rows, CHART_GROUPS["Asset"])
+
+	if not buckets:
+		return None
+
+	# Ranked by the value actually in play this year, so a fully depreciated bucket with a zero
+	# closing WDV does not outrank a large addition.
+	buckets.sort(key=lambda b: b["opening_wdv"] + b["addition"], reverse=True)
+	shown, others = buckets[:CHART_LIMIT], buckets[CHART_LIMIT:]
+
+	labels = chart_labels(shown)
+	if others:
+		labels.append(_("Others ({0})").format(len(others)))
+
+	datasets = []
+	for label, fieldname, _color in CHART_SERIES:
+		values = [flt(bucket[fieldname], 2) for bucket in shown]
+		if others:
+			values.append(flt(sum(bucket[fieldname] for bucket in others), 2))
+		datasets.append({"name": _(label), "values": values})
+
+	return {
+		"data": {"labels": labels, "datasets": datasets},
+		"type": "bar",
+		"colors": [color for _label, _fieldname, color in CHART_SERIES],
+		"fieldtype": "Currency",
+		"barOptions": {"stacked": 0},
+	}
+
+
+def group_for_chart(rows, fieldname):
+	"""Sum the chart series over `fieldname`, one bucket per distinct value."""
+	buckets = {}
+
+	for row in leaf_rows(rows):
+		if fieldname == CHART_GROUPS["Asset"]:
+			# Two Assets can carry the same name ("Water Cooled Ducts"); they are still two
+			# separate records, so key on the id and let chart_labels() tell them apart.
+			key = row["asset"]
+			label = row.get("asset_description") or row["asset"]
+		else:
+			key = label = row.get(fieldname) or _("Unclassified")
+
+		bucket = buckets.get(key)
+		if bucket is None:
+			bucket = buckets[key] = dict.fromkeys(CHART_FIELDS, 0.0)
+			bucket.update({"key": key, "label": label})
+
+		for chart_field in CHART_FIELDS:
+			bucket[chart_field] += flt(row.get(chart_field))
+
+	return list(buckets.values())
+
+
+def leaf_rows(rows):
+	"""The rows with nothing nested under them.
+
+	Only leaves can be summed. A row that has children either *is* a roll-up of them (a group
+	row) or carries the same money as them — Asset Capitalization adds every consumed row's
+	value to the Target Asset, so a submitted Composite Asset holds its components' value a
+	second time. Leaves are mutually exclusive, so the bars always total to the register
+	whatever shape the hierarchy takes. Depth-first order means a row has children exactly when
+	the row after it sits deeper.
+	"""
+	return [
+		row
+		for index, row in enumerate(rows)
+		if index + 1 >= len(rows) or rows[index + 1]["indent"] <= row["indent"]
+	]
+
+
+def chart_labels(buckets):
+	"""Bucket labels, trimmed to fit an axis and suffixed with the key wherever two read alike."""
+	counts = Counter(bucket["label"] for bucket in buckets)
+	return [
+		truncate(f"{bucket['label']} #{bucket['key'].rsplit('-', 1)[-1]}")
+		if counts[bucket["label"]] > 1
+		else truncate(bucket["label"])
+		for bucket in buckets
+	]
+
+
+def truncate(label, length=28):
+	return label if len(label) <= length else label[: length - 1] + "…"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -117,7 +258,26 @@ def build_asset_tree(rows, filters):
 		if row.get("is_group"):
 			roll_up(row, [nodes[c] for c in children.get(row["asset"], [])])
 
+	flag_restated_rows(ordered)
+
 	return ordered
+
+
+def flag_restated_rows(rows):
+	"""Mark any row that carries its own figures *and* has rows nested under it.
+
+	Asset Capitalization adds every consumed row's value to the Target Asset, so once that target
+	is submitted the same money appears twice in the table — once on the composite, once itemised
+	across its components. The chart sums leaves only and is unaffected; the table shows both, so
+	say which rows are the restatement rather than leaving the reader to work it out.
+	"""
+	for index, row in enumerate(rows):
+		has_children = index + 1 < len(rows) and rows[index + 1]["indent"] > row["indent"]
+		if not has_children or row.get("is_group"):
+			continue
+
+		note = _("Value also itemised in components below")
+		row["remarks"] = f"{row['remarks']}; {note}" if row.get("remarks") else note
 
 
 def walk(asset, parent, indent, nodes, children, sort_key, ordered):

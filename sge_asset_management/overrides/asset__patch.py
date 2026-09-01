@@ -37,7 +37,10 @@ def custom_update_target_asset(self):
 		purchase_amount     = asset_doc.purchase_amount     + total_target_asset_value
 		total_asset_cost    = asset_doc.total_asset_cost    + total_target_asset_value
 
-		asset_doc.db_set(
+	# Outside the else: the docstatus==2 branch computed the reversal and then never wrote it,
+	# so cancelling an Asset Capitalization left its value sitting on the Target Asset. Core
+	# db_sets unconditionally after the same if/else.
+	asset_doc.db_set(
 		{
 			"net_purchase_amount": net_purchase_amount,
 			"purchase_amount": purchase_amount,

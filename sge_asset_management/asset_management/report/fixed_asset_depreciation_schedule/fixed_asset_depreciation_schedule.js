@@ -37,6 +37,16 @@ frappe.query_reports["Fixed Asset Depreciation Schedule"] = {
 			fieldtype: "Link",
 			options: "Location",
 		},
+		{
+			// A register can run to thousands of Assets, so the chart sums them into buckets
+			// rather than drawing a bar each. Classification is the Schedule II grouping this
+			// schedule is computed against; pick "Asset" only on a small, filtered set.
+			fieldname: "chart_group_by",
+			label: __("Chart Group By"),
+			fieldtype: "Select",
+			options: ["Classification", "Asset Category", "Location", "Asset"],
+			default: "Classification",
+		},
 	],
 
 	// Rows are nested by the Asset's Parent Asset (custom_parent_asset) — the link that
