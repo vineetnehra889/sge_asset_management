@@ -38,14 +38,14 @@ frappe.query_reports["Fixed Asset Depreciation Schedule"] = {
 			options: "Location",
 		},
 		{
-			// A register can run to thousands of Assets, so the chart sums them into buckets
-			// rather than drawing a bar each. Classification is the Schedule II grouping this
-			// schedule is computed against; pick "Asset" only on a small, filtered set.
-			fieldname: "chart_group_by",
-			label: __("Chart Group By"),
+			// Drives the table and the chart together. "Asset Hierarchy" nests rows the way the
+			// Assets are nested, by Parent Asset; anything else adds a heading row per distinct
+			// value with those hierarchies underneath, and the chart draws one bar per heading.
+			fieldname: "group_by",
+			label: __("Group By"),
 			fieldtype: "Select",
-			options: ["Classification", "Asset Category", "Location", "Asset"],
-			default: "Classification",
+			options: ["Asset Hierarchy", "Classification", "Asset Category", "Location"],
+			default: "Asset Hierarchy",
 		},
 	],
 
@@ -61,10 +61,10 @@ frappe.query_reports["Fixed Asset Depreciation Schedule"] = {
 	formatter: function (value, row, column, data, default_formatter) {
 		value = default_formatter(value, row, column, data);
 
-		// A group row is an ancestor with no depreciation schedule of its own, so its figures
-		// are a roll-up of the components below it — set them apart from real asset rows.
+		// A group row is a heading, or an ancestor with no depreciation schedule of its own, so
+		// its figures are a roll-up of what sits below — set them apart from real asset rows.
 		const is_group = data && data.is_group;
-		if (is_group && column.fieldname === "asset") {
+		if (is_group && ["asset", "tree_label"].includes(column.fieldname)) {
 			value = `<span style="font-weight:600">${value}</span>`;
 		}
 

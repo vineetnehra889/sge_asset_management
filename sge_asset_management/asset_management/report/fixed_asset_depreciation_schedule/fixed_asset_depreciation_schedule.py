@@ -53,21 +53,39 @@ def execute(filters=None):
 	# silently shown with the wrong method's numbers.
 	rows = get_register_rows(filters, depreciation_methods={"Written Down Value"})
 	data = build_asset_tree(rows, filters)
-	return get_tree_columns(), data, None, get_chart(data, filters)
+
+	group_field = GROUP_BY_FIELDS.get(filters.get("group_by"))
+	if group_field:
+		data = apply_group_by(data, group_field, filters)
+
+	return get_tree_columns(filters), data, None, get_chart(data, filters)
 
 
 LEAD_COLUMNS = ("asset", "asset_description")
 
 
-def get_tree_columns():
-	"""Same columns as the flat register, led by the Asset link and its name.
+def get_tree_columns(filters):
+	"""Same columns as the flat register, led by whatever the tree nests on.
 
-	The Asset link has to come first — frappe-datatable draws the expand/collapse control on the
-	first column only — and the name follows it, so the two things that identify a row are side
-	by side instead of the name sitting eight columns to the right.
+	frappe-datatable draws the expand/collapse control on the first column only, so that column
+	has to carry the tree label. Nesting on the Asset hierarchy it is the Asset link itself, with
+	the name beside it; grouped by a dimension the heading rows are not Assets at all, so a plain
+	text column leads and the Asset link follows it.
 	"""
 	columns = {c["fieldname"]: c for c in get_columns()}
 	rest = [c for c in get_columns() if c["fieldname"] not in LEAD_COLUMNS]
+
+	group_by = filters.get("group_by")
+	if GROUP_BY_FIELDS.get(group_by):
+		return [
+			{
+				"label": _("{0} / Asset").format(_(group_by)),
+				"fieldname": "tree_label",
+				"fieldtype": "Data",
+				"width": 280,
+			},
+			dict(columns["asset"], width=180),
+		] + rest
 
 	return [
 		dict(columns["asset"], width=200),
@@ -76,19 +94,20 @@ def get_tree_columns():
 
 
 # ─────────────────────────────────────────────────────────────────
-#  Chart
+#  Grouping and chart
 # ─────────────────────────────────────────────────────────────────
-# A register routinely holds several thousand Assets, so the chart buckets them rather than
-# drawing one bar per Asset. Schedule II classification is the default because that is the
-# grouping this schedule is computed against; the rest are the other dimensions the report
-# already carries per row.
-CHART_GROUPS = {
+# The Group By filter drives both the table and the chart. Leaving it on "Asset Hierarchy"
+# nests rows the way the Assets themselves are nested, by Parent Asset; picking a dimension
+# adds a heading row per distinct value with those hierarchies underneath.
+GROUP_BY_FIELDS = {
 	"Classification": "classification",
 	"Asset Category": "ledger_name",
 	"Location": "location",
-	"Asset": "asset_description",
 }
-DEFAULT_CHART_GROUP = "Classification"
+# A register routinely holds several thousand Assets, so a chart of one bar per Asset is only
+# ever a fallback — used when the table is in hierarchy mode and there is nothing else to
+# compare by.
+CHART_ASSET_FIELD = "asset_description"
 
 # Past this many bars a grouped four-series chart stops being readable. The tail is summed into
 # a single "Others" bar rather than dropped, so the chart still totals to the report.
@@ -103,21 +122,73 @@ CHART_SERIES = (
 CHART_FIELDS = tuple(fieldname for _label, fieldname, _color in CHART_SERIES)
 
 
+def apply_group_by(rows, fieldname, filters):
+	"""Wrap the hierarchy in one heading row per distinct value of `fieldname`.
+
+	The dimension is read off each *root* and its whole subtree moves with it — a component
+	belongs under the same heading as the asset it was capitalized into, so splitting one tree
+	across headings by each row's own category would defeat the hierarchy.
+
+	A heading totals the *leaves* beneath it rather than the rows directly under it: a submitted
+	Composite Asset carries its components' value as well as the components themselves, so adding
+	the roots would count that money twice. It also makes every heading and its chart bar the
+	same number, by construction.
+	"""
+	subtrees = []
+	for row in rows:
+		if row["indent"] == 0:
+			subtrees.append([])
+		subtrees[-1].append(row)
+
+	buckets = {}
+	for subtree in subtrees:
+		buckets.setdefault(subtree[0].get(fieldname) or _("Unclassified"), []).extend(subtree)
+
+	grouped = []
+	for key in sorted(buckets):
+		bucket_rows = buckets[key]
+
+		heading = {
+			"tree_label": key,
+			"indent": 0,
+			"parent_asset": None,
+			"from_date": filters.from_date,
+			"to_date": filters.to_date,
+			"is_group": 1,
+			"is_group_header": 1,
+			"remarks": _("Group total"),
+		}
+		roll_up(heading, leaf_rows(bucket_rows))
+		grouped.append(heading)
+
+		for row in bucket_rows:
+			row["indent"] += 1
+			row["tree_label"] = row.get("asset_description") or row["asset"]
+			grouped.append(row)
+
+	return grouped
+
+
 def get_chart(rows, filters):
 	"""Grouped bars of opening WDV → additions → depreciation → closing WDV per bucket.
 
 	Buckets, not Assets: a company with six thousand Assets would otherwise get six thousand
-	bars, and picking the largest handful of them says nothing about the register as a whole —
-	whereas the same figures summed by classification are exactly the Schedule II summary the
-	schedule is built to support.
+	bars, and picking the largest handful of them says nothing about the register as a whole.
+	When the table is grouped the bars are its heading rows, so the two always agree.
 	"""
-	fieldname = CHART_GROUPS.get(filters.get("chart_group_by")) or CHART_GROUPS[DEFAULT_CHART_GROUP]
-	buckets = group_for_chart(rows, fieldname)
-
-	# One bucket is not a comparison — a single-hierarchy period (or a register where every
-	# asset shares a classification) reads better broken back out into its individual assets.
-	if len(buckets) < 2 and fieldname != CHART_GROUPS["Asset"]:
-		buckets = group_for_chart(rows, CHART_GROUPS["Asset"])
+	if GROUP_BY_FIELDS.get(filters.get("group_by")):
+		buckets = [
+			dict({field: flt(row.get(field)) for field in CHART_FIELDS}, key=row["tree_label"], label=row["tree_label"])
+			for row in rows
+			if row.get("is_group_header")
+		]
+	else:
+		# A bar chart cannot draw a hierarchy, so aggregate the leaves by classification —
+		# the same figures summed the way the Schedule II summary wants them — and drop back
+		# to individual assets only when there is a single classification to compare.
+		buckets = group_for_chart(rows, GROUP_BY_FIELDS["Classification"])
+		if len(buckets) < 2:
+			buckets = group_for_chart(rows, CHART_ASSET_FIELD)
 
 	if not buckets:
 		return None
@@ -152,7 +223,7 @@ def group_for_chart(rows, fieldname):
 	buckets = {}
 
 	for row in leaf_rows(rows):
-		if fieldname == CHART_GROUPS["Asset"]:
+		if fieldname == CHART_ASSET_FIELD:
 			# Two Assets can carry the same name ("Water Cooled Ducts"); they are still two
 			# separate records, so key on the id and let chart_labels() tell them apart.
 			key = row["asset"]
@@ -177,7 +248,7 @@ def leaf_rows(rows):
 	Only leaves can be summed. A row that has children either *is* a roll-up of them (a group
 	row) or carries the same money as them — Asset Capitalization adds every consumed row's
 	value to the Target Asset, so a submitted Composite Asset holds its components' value a
-	second time. Leaves are mutually exclusive, so the bars always total to the register
+	second time. Leaves are mutually exclusive, so the totals always come to the register
 	whatever shape the hierarchy takes. Depth-first order means a row has children exactly when
 	the row after it sits deeper.
 	"""
@@ -392,7 +463,7 @@ def build_group_rows(asset_names, filters):
 
 
 def roll_up(row, child_rows):
+	"""Every field is written, zero included — a currency column that reads 0.00 on detail rows
+	and blank on the row totalling them looks like a rendering fault, not a nil balance."""
 	for field in ROLLUP_FIELDS:
-		total = sum(flt(child.get(field)) for child in child_rows)
-		if total:
-			row[field] = total
+		row[field] = sum(flt(child.get(field)) for child in child_rows)
