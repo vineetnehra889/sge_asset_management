@@ -8,7 +8,7 @@ app_license = "mit"
 # Apps
 # ------------------
 
-# required_apps = []
+required_apps = ["sge_sehyog_customizations"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -43,10 +43,24 @@ app_license = "mit"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {
+    "Asset": "public/js/asset.js",
+    "Asset Capitalization": "public/js/asset_capitalization.js",
+}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
+
+# Changing Specific Class pooFunction
+# Patch the class method
+from sge_asset_management.overrides.asset__patch import custom_update_target_asset, custom_validate_asset_values
+
+from erpnext.assets.doctype.asset.asset import Asset
+from erpnext.assets.doctype.asset_capitalization.asset_capitalization import AssetCapitalization
+
+# Patch
+Asset.validate_asset_values = custom_validate_asset_values
+AssetCapitalization.update_target_asset = custom_update_target_asset
 
 # Svg Icons
 # ------------------
@@ -138,13 +152,27 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+    "Asset Maintenance": {
+        "before_save": "sge_asset_management.feature.asset_maintenance.validate",
+    },
+    "Asset": {
+        "validate": "sge_asset_management.feature.parent_asset.set_defaults_for_parent_asset",
+        "on_submit": "sge_asset_management.feature.composite_component_capitalization.append_composite_component_to_asset_capitalization",
+        "before_cancel": "sge_asset_management.feature.composite_component_capitalization.remove_composite_component_from_asset_capitalization",
+    },
+    "Asset Capitalization": {
+        "before_gl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
+        "before_sl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
+        "validate": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
+        "before_submit": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
+        # Runs after the controller's own on_submit (which posts the ledgers and rolls the
+        # consumed value into the Target Asset), so the component Assets below are raised
+        # against a Target Asset that already carries its final value.
+        "on_submit": "sge_asset_management.feature.component_asset_creation.create_component_assets",
+        "on_cancel": "sge_asset_management.feature.component_asset_creation.cancel_component_assets",
+    },
+}
 
 # Scheduled Tasks
 # ---------------
