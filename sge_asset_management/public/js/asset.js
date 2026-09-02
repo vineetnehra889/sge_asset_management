@@ -17,6 +17,31 @@ frappe.ui.form.on("Asset", {
 		}));
 	},
 
+	// A Parent Asset is a pure grouping record (see feature/parent_asset.py) — it never holds
+	// value, is never depreciated, and books no GL entries, so none of core's create/disposal
+	// actions apply to it. This runs after core's own refresh (this file loads after erpnext's
+	// asset.js, and both are bound to the same "refresh" event in script-load order), so the
+	// buttons removed here have already been added by the time this fires.
+	refresh(frm) {
+		if (frm.doc.asset_type !== "Parent Asset") return;
+
+		["Asset Value Adjustment", "Asset Repair", "Depreciation Entry"].forEach((label) =>
+			frm.remove_custom_button(label, __("Create"))
+		);
+		["Maintain Asset", "Split Asset", "Transfer Asset", "Scrap Asset", "Sell Asset"].forEach(
+			(label) => frm.remove_custom_button(label, __("Actions"))
+		);
+		frm.remove_custom_button(__("Restore Asset"));
+
+		// Cancelling is blocked server-side too (restrict_parent_asset_cancellation) — hidden
+		// here so the block isn't the user's first sign that a Parent Asset plays by different
+		// rules. clear_secondary_action() is the same call core uses to remove Cancel itself:
+		// it hides the button and unbinds the click, not just a CSS toggle.
+		if (frm.doc.docstatus === 1) {
+			frm.page.clear_secondary_action();
+		}
+	},
+
     asset_type: function (frm) {
 		if (frm.doc.docstatus == 0) {
 			if (frm.doc.asset_type == "Composite Asset") {

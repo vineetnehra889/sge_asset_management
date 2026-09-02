@@ -48,7 +48,13 @@ doctype_js = {
     "Asset Capitalization": "public/js/asset_capitalization.js",
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
-# doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
+doctype_tree_js = {"Asset": "public/js/asset_tree.js"}
+
+# Asset is not a Nested Set doctype and belongs to erpnext, so it cannot be given lft/rgt or
+# is_group. The tree view is gated by this hook rather than by any doctype flag, and
+# frappe.treeview_settings["Asset"] (public/js/asset_tree.js) points the node fetch at our own
+# method, which walks custom_parent_asset. Route: /app/asset/view/tree
+treeviews = ["Asset"]
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
 
 # Changing Specific Class pooFunction
@@ -165,7 +171,10 @@ doc_events = {
             # a real asset, rather than one capitalization at a time against a draft target.
             "sge_asset_management.feature.component_asset_creation.create_component_assets",
         ],
-        "before_cancel": "sge_asset_management.feature.composite_component_capitalization.remove_composite_component_from_asset_capitalization",
+        "before_cancel": [
+            "sge_asset_management.feature.parent_asset.restrict_parent_asset_cancellation",
+            "sge_asset_management.feature.composite_component_capitalization.remove_composite_component_from_asset_capitalization",
+        ],
         # on_cancel, not before_cancel: frappe runs on_cancel ahead of the "still linked" check,
         # and the component Assets link back through custom_parent_asset.
         "on_cancel": "sge_asset_management.feature.component_asset_creation.cancel_component_assets_for_target",
