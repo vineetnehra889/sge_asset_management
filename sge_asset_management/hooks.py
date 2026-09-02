@@ -173,8 +173,14 @@ doc_events = {
     "Asset Capitalization": {
         "before_gl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
         "before_sl_preview": "sge_asset_management.overrides.asset_capitalization.enable_stock_ledger_for_preview",
-        "validate": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
-        "before_submit": "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
+        "validate": [
+            "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
+            "sge_asset_management.overrides.asset_capitalization.restrict_parent_asset_consumption",
+        ],
+        "before_submit": [
+            "sge_asset_management.overrides.asset_capitalization.restrict_zero_value_consumed_assets",
+            "sge_asset_management.overrides.asset_capitalization.restrict_parent_asset_consumption",
+        ],
         # Cancelling a capitalization after its target was submitted takes the value back off
         # the target, so the components it contributed have to go with it.
         "on_cancel": "sge_asset_management.feature.component_asset_creation.cancel_component_assets",

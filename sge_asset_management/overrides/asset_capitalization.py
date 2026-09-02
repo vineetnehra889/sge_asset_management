@@ -24,6 +24,29 @@ def restrict_zero_value_consumed_assets(doc, method=None):
 		)
 
 
+def restrict_parent_asset_consumption(doc, method=None):
+	"""Block a Parent Asset from being consumed.
+
+	A Parent Asset holds no value of its own — what it is worth is already itemised across the
+	Assets beneath it — so capitalizing one would move a subtree under a new target while
+	crediting a fixed asset balance that was never debited. The picker in
+	public/js/asset_capitalization.js filters these out, but a picker is a convenience: an API
+	call, a data import or a server script reaches this table directly.
+	"""
+	parents = [
+		d.asset
+		for d in doc.get("asset_items", [])
+		if d.asset and frappe.db.get_value("Asset", d.asset, "asset_type") == "Parent Asset"
+	]
+	if parents:
+		frappe.throw(
+			_(
+				"Consumed Asset(s) {0} are Parent Assets and cannot be capitalized. "
+				"Their value is already held by the Assets beneath them — consume those instead."
+			).format(", ".join(frappe.bold(a) for a in parents))
+		)
+
+
 def enable_stock_ledger_for_preview(doc, method=None):
 	"""Make the draft-state ledger preview include consumed stock items.
 

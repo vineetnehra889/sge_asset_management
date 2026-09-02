@@ -114,6 +114,13 @@ frappe.query_reports["Fixed Asset Depreciation Schedule"] = {
 		// is a subtotal, so everything on it goes semi-bold.
 		const is_group = !!data.is_group;
 
+		// A heading is read by name, not by document id. Keep it clickable by rebuilding the
+		// link rather than letting default_formatter print the Asset id it was given.
+		if (is_group && column.fieldname === "asset" && data.asset && data.asset_description) {
+			const label = frappe.utils.escape_html(data.asset_description);
+			return `<a href="/app/asset/${encodeURIComponent(data.asset)}" style="font-weight:600;">${label}</a>`;
+		}
+
 		if (column.fieldname === "opening_asset" && data.opening_asset) {
 			return fads.pill(value, data.opening_asset === "Y" ? "blue" : "green");
 		}

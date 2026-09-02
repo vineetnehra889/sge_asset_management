@@ -16,6 +16,10 @@ frappe.ui.form.on('Asset Capitalization', {
 				// fails to post (see restrict_zero_value_consumed_assets), so keep
 				// them out of the picker entirely.
 				net_purchase_amount: [">", 0],
+				// A Parent Asset is a grouping record, not something you can consume:
+				// its value is already itemised across the Assets hanging off it, and
+				// consuming it would drag that whole subtree under the new target.
+				asset_type: ["!=", "Parent Asset"],
 			};
 
 			if (frm.doc.target_asset) {

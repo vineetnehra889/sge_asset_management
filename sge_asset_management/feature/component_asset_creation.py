@@ -2,6 +2,9 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt, getdate
 from erpnext.assets.doctype.asset.asset import get_item_details
+from erpnext.assets.doctype.asset_depreciation_schedule.asset_depreciation_schedule import (
+	cancel_asset_depr_schedules,
+)
 
 # Each consumed table on Asset Capitalization contributes component Assets, but the fieldnames
 # carrying quantity/value differ per table. Keep the differences in one place so the submit
@@ -66,7 +69,34 @@ def create_component_assets(doc, method=None):
 			if _tag_consumed_asset(doc, row):
 				tagged.append(row.asset)
 
+	if created or tagged:
+		_convert_to_parent_asset(doc)
+
 	_notify(doc, created, tagged)
+
+
+def _convert_to_parent_asset(target):
+	"""Once its components exist, the composite stops being an asset in its own right and
+	becomes the grouping record for them.
+
+	Its value is now itemised across the Assets beneath it, so leaving it typed as a Composite
+	Asset makes the register show the same money twice — once here and once spread below. As a
+	Parent Asset the Fixed Asset Depreciation Schedule renders it as a heading carrying the
+	roll-up of its children instead of a figure of its own.
+
+	Calculate Depreciation goes off with it, and the schedules core activated moments ago in
+	Asset.on_submit are cancelled — the charge now belongs to the components, and leaving the
+	schedules live would book it on both sides. The Asset property setters hide the checkbox on
+	a Parent Asset, so it cannot be switched back on afterwards.
+
+	db_set rather than a save: neither field is allow-on-submit, and the document has just been
+	submitted, so re-running validate() here would fight core's own submit handling.
+	"""
+	if cint(target.calculate_depreciation):
+		cancel_asset_depr_schedules(target)
+		target.db_set("calculate_depreciation", 0, update_modified=False)
+
+	target.db_set("asset_type", "Parent Asset", update_modified=False)
 
 
 def capitalizations_for(target):
@@ -89,9 +119,9 @@ def cancel_component_assets_for_target(doc, method=None):
 	Assets link back to this one through `custom_parent_asset`, so they have to be cancelled
 	first or the cancel is refused for being linked.
 	"""
-	if doc.asset_type != "Composite Asset":
-		return
-
+	# Deliberately not keyed on asset_type: create_component_assets() retypes the target to
+	# "Parent Asset" once its components exist, so checking for "Composite Asset" here would
+	# skip exactly the assets that have something to unwind.
 	_cancel_assets(
 		frappe.get_all(
 			"Asset",
@@ -125,17 +155,47 @@ def cancel_component_assets(doc, method=None):
 	_restore_consumed_parents(doc)
 
 
+# Core's Asset.validate_cancellation() only lets these through. A component that has since been
+# scrapped, sold or capitalized elsewhere carries disposal accounting of its own.
+CANCELLABLE_STATUSES = ("Submitted", "Partially Depreciated", "Fully Depreciated")
+
+
 def _cancel_assets(names):
 	"""Cancel rather than delete: these are submitted documents in their own right and may
 	already be referenced elsewhere (Asset Movement, Asset Activity). A component still in draft
-	has no such history, so it goes."""
+	has no such history, so it goes.
+
+	A component that has been disposed of since it was created is left alone — reversing it here
+	would quietly undo its own disposal entries, and attempting it throws "Asset cannot be
+	cancelled, as it is already Scrapped", which aborts the entire capitalization cancel. Its
+	parent link is cleared instead, both so it stops blocking the parent's own cancel and
+	because it is no longer part of the build being unwound.
+	"""
+	skipped = []
+
 	for name in names:
 		asset = frappe.get_doc("Asset", name)
-		if asset.docstatus == 1:
-			asset.flags.ignore_permissions = True
-			asset.cancel()
-		else:
+
+		if asset.docstatus != 1:
 			frappe.delete_doc("Asset", name, force=True, ignore_permissions=True)
+			continue
+
+		if asset.status not in CANCELLABLE_STATUSES:
+			skipped.append((name, asset.status))
+			frappe.db.set_value("Asset", name, "custom_parent_asset", None, update_modified=False)
+			continue
+
+		asset.flags.ignore_permissions = True
+		asset.cancel()
+
+	if skipped:
+		frappe.msgprint(
+			_("Left in place because they can no longer be cancelled: {0}. They are detached from their Parent Asset — reverse them yourself if that is wrong.").format(
+				", ".join(f"{_asset_link(name)} ({status})" for name, status in skipped)
+			),
+			title=_("Component Assets Not Reversed"),
+			indicator="orange",
+		)
 
 
 def _restore_consumed_parents(capitalization):
@@ -197,7 +257,7 @@ def _create_component_asset(capitalization, target, row, source, qty, amount):
 		{
 			"company": target.company,
 			"item_code": component_item,
-			"asset_name": row.item_name or row.item_code,
+			"asset_name": _component_asset_name(target, row),
 			"asset_category": asset_category,
 			# "Existing Asset" is the only type core exempts from needing a Purchase
 			# Receipt/Invoice while still allowing depreciation — "Composite Component" would
@@ -222,6 +282,13 @@ def _create_component_asset(capitalization, target, row, source, qty, amount):
 	asset.submit()
 
 	return asset.name
+
+
+def _component_asset_name(target, item_row):
+	"""`<composite> - <item>`, so a component reads as belonging to something rather than being
+	one of several identically named Assets across the register. Asset Name is a Data field, so
+	the result is clipped to its 140-character limit."""
+	return f"{target.asset_name} - {item_row.item_name or item_row.item_code}"[:140]
 
 
 def _tag_consumed_asset(target, row):
@@ -314,18 +381,18 @@ def _resolve_asset_category(item_code, target):
 
 
 def _apply_depreciation(asset, target, item_code, asset_category, amount, in_use_date):
-	"""Depreciate a component only when the composite it belongs to does not.
+	"""A component depreciates exactly when the composite it was built into said it should.
 
-	Asset Capitalization adds every consumed row's value to the Target Asset's own net purchase
-	amount (update_target_asset), so when the composite is being depreciated as a whole,
-	depreciating the components as well would book the same charge twice. Otherwise the component
-	picks up the Asset Category's finance-book defaults.
+	Calculate Depreciation is ticked on the Composite Asset while it is being built; on submit
+	that decision moves down here, to the Assets that actually hold the value, and is switched
+	off on the composite itself (see _convert_to_parent_asset). One tick, applied at the level
+	where depreciation belongs, so the charge is never booked on both.
 
 	The finance book rows have to be seeded here rather than left to Asset.set_missing_values —
 	validate() runs validate_asset_values() (which rejects calculate_depreciation with no books)
 	several steps before set_missing_values() would fill them in.
 	"""
-	if cint(target.calculate_depreciation):
+	if not cint(target.calculate_depreciation):
 		return
 	if frappe.db.get_value("Asset Category", asset_category, "non_depreciable_category"):
 		return
