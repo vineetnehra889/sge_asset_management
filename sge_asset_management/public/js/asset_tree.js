@@ -3,8 +3,11 @@ frappe.provide("sge_asset_management.asset_tree");
 
 // Parent-ish types get a colour; the leaves stay grey. The point of the pill is to tell at a
 // glance which rows hold a hierarchy and which are the assets themselves.
-// Header and rows share these, so the labels sit over the columns they describe.
-sge_asset_management.asset_tree.col = { type: 165, value: 130 };
+// Only the value column is fixed width -- it is the one meant to line up like a Chart of
+// Accounts balance. The type pill sits at whatever width its own label needs (nowrap, so a
+// two-word type like "Composite Component" never breaks across lines); a fixed box narrower
+// than that text was what wrapped it in the first place.
+sge_asset_management.asset_tree.col = { value: 130 };
 
 // The framework never assigns frappe.treeview_settings["Asset"].treeview -- Account gets its
 // instance handed to onload(). Stash it there and read the live filter values off the page,
@@ -147,16 +150,16 @@ frappe.treeview_settings["Asset"] = {
 
 		const data = node.data;
 
-		// Type and value go into one right-floated block, each in a fixed-width slot, the way
-		// the Chart of Accounts floats a balance before node.$ul. Appending them into the tree
-		// link instead would leave both trailing the name, so their position would shift with
-		// every name length and neither would form a column.
+		// Type and value go into one right-floated block, the way the Chart of Accounts floats
+		// a balance before node.$ul. Appending them into the tree link instead would leave both
+		// trailing the name, so their position would shift with every name length and neither
+		// would form a column.
 		node.parent && node.parent.find(".asset-meta-area").remove();
 
 		let type = "";
 		if (data.asset_type) {
 			const colour = sge_asset_management.asset_tree.type_colours[data.asset_type] || "gray";
-			type = `<span class="indicator-pill ${colour}">${frappe.utils.escape_html(
+			type = `<span class="indicator-pill ${colour}" style="white-space:nowrap;">${frappe.utils.escape_html(
 				data.asset_type
 			)}</span>`;
 		}
@@ -175,9 +178,9 @@ frappe.treeview_settings["Asset"] = {
 
 		const col = sge_asset_management.asset_tree.col;
 		$(
-			`<span class="asset-meta-area pull-right">
-				<span style="display:inline-block;width:${col.type}px;">${type}</span>
-				<span style="display:inline-block;width:${col.value}px;text-align:right;">${value}</span>
+			`<span class="asset-meta-area pull-right" style="display:flex;align-items:center;gap:12px;">
+				<span style="white-space:nowrap;">${type}</span>
+				<span style="display:inline-block;width:${col.value}px;text-align:right;white-space:nowrap;">${value}</span>
 			</span>`
 		).insertBefore(node.$ul);
 	},

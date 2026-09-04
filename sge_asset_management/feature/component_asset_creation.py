@@ -35,10 +35,17 @@ def create_component_assets(doc, method=None):
 	one), so a mirror fixed-asset Item is created first — `FA-<item code>` — and the Asset is
 	raised against that.
 
-	A Consumed Asset row already *is* an Asset, so no Item/Asset is created for it; it is only
-	tagged with this asset as its Parent Asset. Creating a second Asset for it would duplicate
-	the same asset in the register. That is also what nests a previously capitalized Composite
-	Asset under the one it was consumed into, giving the register a tree more than two deep.
+	A Consumed Asset row already *is* an Asset, and it is tagged with this asset as its Parent
+	Asset — both for traceability (opening the original still shows where it went) and so a
+	previously capitalized Composite Asset nests under the one it was consumed into, giving the
+	register a tree more than two deep. But core's own Asset Capitalization already closes that
+	original asset out — set_asset_values() computes its value as of the disposal date and books
+	it to the target via GL entries, then set_consumed_asset_status() marks it "Capitalized",
+	after which its own depreciation schedule carries no further value. Left at that, the
+	register tree would show the original nested under its new parent at ₹0 with the value it
+	actually contributed nowhere on the branch. A second, value-bearing Asset is raised for it
+	exactly as for a Stock/Service row — against the same Item, since the source is already a
+	fixed asset — carrying the row's `asset_value` so the branch's rollup is correct.
 
 	Every Asset produced here carries `custom_parent_asset = this asset`, which is what the
 	Fixed Asset Depreciation Schedule tree report reads to nest components under the asset they
@@ -47,32 +54,49 @@ def create_component_assets(doc, method=None):
 	if doc.asset_type != "Composite Asset":
 		return
 
-	created, tagged = [], []
+	created, tagged, undepreciated = [], [], []
 
 	for name in capitalizations_for(doc):
 		capitalization = frappe.get_doc("Asset Capitalization", name)
 
 		for table, source, qty_field, amount_field in COMPONENT_TABLES:
 			for row in capitalization.get(table) or []:
-				asset_name = _create_component_asset(
+				amount = flt(row.get(amount_field))
+				asset_name, skipped_depreciation = _create_component_asset(
 					capitalization,
 					doc,
 					row,
 					source,
 					qty=flt(row.get(qty_field)),
-					amount=flt(row.get(amount_field)),
+					amount=amount,
 				)
 				if asset_name:
 					created.append(asset_name)
+					if skipped_depreciation:
+						undepreciated.append((asset_name, amount))
 
 		for row in capitalization.get("asset_items") or []:
 			if _tag_consumed_asset(doc, row):
 				tagged.append(row.asset)
 
+			# Nothing to represent when the consumed asset had already depreciated to nothing
+			# before it was capitalized — an Existing Asset needs a positive Net Purchase Amount
+			# (see Asset.validate_asset_values), so this would otherwise fail the whole submit.
+			if flt(row.get("asset_value")):
+				asset_value = flt(row.get("asset_value"))
+				asset_name, skipped_depreciation = _create_component_asset(
+					capitalization, doc, row, "Consumed Asset", qty=1, amount=asset_value
+				)
+				if asset_name:
+					created.append(asset_name)
+					if skipped_depreciation:
+						undepreciated.append((asset_name, asset_value))
+
 	if created or tagged:
 		_convert_to_parent_asset(doc)
 
 	_notify(doc, created, tagged)
+	_warn_undepreciated(doc, undepreciated)
 
 
 def _convert_to_parent_asset(target):
@@ -223,8 +247,12 @@ def _restore_consumed_parents(capitalization):
 #  Helpers
 # ─────────────────────────────────────────────────────────────────
 def _create_component_asset(capitalization, target, row, source, qty, amount):
+	"""Returns `(asset_name, skipped_depreciation)`. `skipped_depreciation` is True when the
+	component was created without depreciation solely because the target's own Calculate
+	Depreciation happened to be off at submit time, despite the component carrying real cost —
+	see `_apply_depreciation()`."""
 	if not row.item_code:
-		return None
+		return None, False
 
 	# Re-submitting the target, or amending it, must not raise the same component twice.
 	if frappe.db.exists(
@@ -235,7 +263,7 @@ def _create_component_asset(capitalization, target, row, source, qty, amount):
 			"docstatus": ["<", 2],
 		},
 	):
-		return None
+		return None, False
 
 	if not target.location:
 		frappe.throw(
@@ -276,12 +304,12 @@ def _create_component_asset(capitalization, target, row, source, qty, amount):
 			"custom_component_source": source,
 		}
 	)
-	_apply_depreciation(asset, target, component_item, asset_category, amount, in_use_date)
+	skipped_depreciation = _apply_depreciation(asset, target, component_item, asset_category, amount, in_use_date)
 	asset.flags.ignore_permissions = True
 	asset.insert()
 	asset.submit()
 
-	return asset.name
+	return asset.name, skipped_depreciation
 
 
 def _component_asset_name(target, item_row):
@@ -334,6 +362,18 @@ def get_or_create_component_item(source_item_code, asset_category):
 	component_code = f"FA-{source.name}"[:140]
 	if frappe.db.exists("Item", component_code):
 		return component_code
+
+	# Item Tax rows are mandatory on this bench (a Property Setter marks Item.taxes reqd), and
+	# the mirror below carries the source's rows across. With none to copy the mirror is
+	# unsaveable, and letting it fail inside item.insert() surfaces as a bare MandatoryError
+	# against "FA-<code>" — a name the user never entered and would not recognise as the cause.
+	if not source.get("taxes"):
+		frappe.throw(
+			_(
+				"Item {0} has no Item Tax Template set, so a fixed-asset copy of it cannot be "
+				"created for capitalization. Add a tax row on the Item and try again."
+			).format(frappe.bold(source.name))
+		)
 
 	item = frappe.new_doc("Item")
 	item.update(
@@ -391,15 +431,25 @@ def _apply_depreciation(asset, target, item_code, asset_category, amount, in_use
 	The finance book rows have to be seeded here rather than left to Asset.set_missing_values —
 	validate() runs validate_asset_values() (which rejects calculate_depreciation with no books)
 	several steps before set_missing_values() would fill them in.
+
+	Returns True when a component carrying real cost was left without depreciation purely
+	because the target's Calculate Depreciation happened to be off at submit time. That flag is
+	a statement about the composite as a single line item, not about whether the value now being
+	spread across its components should depreciate — copying it verbatim here is the best default
+	available (the alternative, inferring intent from the Asset Category, is no more reliable),
+	but a component with money attached and no depreciation schedule is invisible to registers
+	like the Fixed Asset Depreciation Schedule, so the caller surfaces this rather than letting it
+	pass silently. False in every other case, including the legitimate "category doesn't
+	depreciate" and "off on purpose, zero value" ones below.
 	"""
 	if not cint(target.calculate_depreciation):
-		return
+		return bool(flt(amount))
 	if frappe.db.get_value("Asset Category", asset_category, "non_depreciable_category"):
-		return
+		return False
 
 	books = [b for b in get_item_details(item_code, asset_category, amount) if b.get("depreciation_method")]
 	if not books:
-		return
+		return False
 
 	for book in books:
 		# Core defaults this to today, which trips the "cannot be before Available-for-use Date"
@@ -408,6 +458,7 @@ def _apply_depreciation(asset, target, item_code, asset_category, amount, in_use
 
 	asset.calculate_depreciation = 1
 	asset.set("finance_books", books)
+	return False
 
 
 def _notify(target, created, tagged):
@@ -429,6 +480,32 @@ def _notify(target, created, tagged):
 		)
 
 	frappe.msgprint("<br>".join(lines), title=_("Component Assets"), indicator="green")
+
+
+def _warn_undepreciated(target, undepreciated):
+	"""Flag components that carry real cost but were created without depreciation because
+	`target.calculate_depreciation` was off at submit time (see `_apply_depreciation`).
+
+	Separate, orange msgprint rather than folding into `_notify()`'s green one: this is not part
+	of the "here's what was built" confirmation, it's a heads-up that something worth a second
+	look happened — mirrors how `_cancel_assets()` keeps its own "not reversed" warning apart from
+	the normal flow.
+	"""
+	if not undepreciated:
+		return
+
+	frappe.msgprint(
+		_(
+			"{0} has Calculate Depreciation off, so these component Asset(s) were created without "
+			"a depreciation schedule even though they carry cost: {1}. If that cost should "
+			"depreciate, enable Calculate Depreciation on them directly."
+		).format(
+			frappe.bold(target.name),
+			", ".join(f"{_asset_link(name)} ({frappe.format(amount, {'fieldtype': 'Currency'})})" for name, amount in undepreciated),
+		),
+		title=_("Components Created Without Depreciation"),
+		indicator="orange",
+	)
 
 
 def _asset_link(name):

@@ -172,7 +172,7 @@ def apply_group_by(rows, fieldname, filters):
 def get_chart(rows, filters):
 	"""Grouped bars of opening WDV → additions → depreciation → closing WDV per bucket.
 
-	Buckets, not Assets: a company with six thousand Assets would otherwise get six thousand
+	Buckets, not Assets: a company with six thousand Assets would otherwise get six thousand is Not Same UI as 
 	bars, and picking the largest handful of them says nothing about the register as a whole.
 	When the table is grouped the bars are its heading rows, so the two always agree.
 	"""
